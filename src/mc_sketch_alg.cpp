@@ -13,7 +13,7 @@
 #include <data_structure/graph_access.h>
 #include <data_structure/mutable_graph.h>
 
-MCSketchAlg::MCSketchAlg(node_id_t num_vertices, bool cuda_uvm, size_t seed, Bucket* buckets, int _max_sketch_graphs, CCAlgConfiguration config)
+MCSketchAlg::MCSketchAlg(node_id_t num_vertices, size_t seed, int _max_sketch_graphs, CCAlgConfiguration config)
     : num_vertices(num_vertices), seed(seed), dsu(num_vertices), config(config) {
   representatives = new std::set<node_id_t>();
   max_sketch_graphs = _max_sketch_graphs;
@@ -24,21 +24,6 @@ MCSketchAlg::MCSketchAlg(node_id_t num_vertices, bool cuda_uvm, size_t seed, Buc
   size_t sketch_num_buckets = sketch_num_columns * sketch_bkt_per_col + 1;
 
   sketches = new Sketch *[num_vertices * max_sketch_graphs];
-
-  if (cuda_uvm) {
-    for (int graph_id = 0; graph_id < max_sketch_graphs; graph_id++) {
-      for (node_id_t i = 0; i < num_vertices; ++i) {
-        sketches[(graph_id * num_vertices) + i] = new Sketch(sketch_vec_len, seed, i, &buckets[graph_id * num_vertices * sketch_num_buckets], sketch_num_samples);
-      }
-    }
-  }
-  else {
-    for (int graph_id = 0; graph_id < max_sketch_graphs; graph_id++) {
-      for (node_id_t i = 0; i < num_vertices; ++i) {
-        sketches[(graph_id * num_vertices) + i] = new Sketch(sketch_vec_len, seed, sketch_num_samples);
-      }
-    }
-  }
 
   for (node_id_t i = 0; i < num_vertices; ++i) {
     representatives->insert(i);
@@ -100,6 +85,35 @@ MCSketchAlg::~MCSketchAlg() {
   delete representatives;
   delete[] spanning_forest;
   delete[] spanning_forest_mtx;
+}
+
+void MCSketchAlg::create_sketch_graph(int graph_id, SketchParams sketchParams) {
+  // Validate graph_id
+  if (graph_id >= max_sketch_graphs || graph_id != num_sketch_graphs) {
+    std::cout << "Invalid graph_id in create_sketch_graph()! " << graph_id << "\n";
+    return;
+  }
+
+  std::cout << "Creating sketches for graph #" << graph_id << "\n";
+
+  vec_t sketch_vec_len = Sketch::calc_vector_length(num_vertices);
+  size_t sketch_num_samples = Sketch::calc_cc_samples(num_vertices, config.get_sketches_factor());
+
+  if (sketchParams.cudaUVM_enabled) {
+    Bucket* cudaUVM_buckets;
+    gpuErrchk(cudaMallocManaged(&cudaUVM_buckets, num_vertices * sketchParams.num_buckets * sizeof(Bucket)));
+    sketchParams.cudaUVM_buckets = cudaUVM_buckets;
+    for (node_id_t i = 0; i < num_vertices; ++i) {
+      sketches[(graph_id * num_vertices) + i] = new Sketch(sketch_vec_len, seed, i, cudaUVM_buckets, sketch_num_samples);
+    }
+  }
+  else {
+    for (node_id_t i = 0; i < num_vertices; ++i) {
+      sketches[(graph_id * num_vertices) + i] = new Sketch(sketch_vec_len, seed, sketch_num_samples);
+    }
+  }
+
+  num_sketch_graphs++;
 }
 
 void MCSketchAlg::pre_insert(GraphUpdate upd, int /* thr_id */) {
@@ -164,12 +178,14 @@ void MCSketchAlg::apply_raw_buckets_update(node_id_t src_vertex, Bucket *raw_buc
 
 // Note: for performance reasons route updates through the driver instead of calling this function
 //       whenever possible.
-void MCSketchAlg::update(GraphUpdate upd) {
+void MCSketchAlg::update_subgraph(int graph_id, GraphUpdate upd) {
   pre_insert(upd, 0);
   Edge edge = upd.edge;
 
-  sketches[edge.src]->update(static_cast<vec_t>(concat_pairing_fn(edge.src, edge.dst)));
-  sketches[edge.dst]->update(static_cast<vec_t>(concat_pairing_fn(edge.src, edge.dst)));
+  sketches[(num_vertices * graph_id) + edge.src]->update(
+      static_cast<vec_t>(concat_pairing_fn(edge.src, edge.dst)));
+  sketches[(num_vertices * graph_id) + edge.dst]->update(
+      static_cast<vec_t>(concat_pairing_fn(edge.src, edge.dst)));
 }
 
 // sample from a sketch that represents a supernode of vertices
@@ -446,6 +462,8 @@ bool MCSketchAlg::perform_k_boruvka_round(const size_t cur_round,
                                         const std::vector<MergeInstr> &merge_instr,
                                         std::vector<GlobalMergeData> &global_merges,
                                         int graph_id) {
+  // std::cerr << "perform_k_boruvka_round()" << std::endl;
+
   if (cur_round == 0) {
     return run_k_round_zero(graph_id);
   }
@@ -713,6 +731,8 @@ void MCSketchAlg::boruvka_emulation() {
 }
 
 void MCSketchAlg::k_boruvka_emulation(int graph_id) {
+  // std::cerr << "k_boruvka_emulation()" << std::endl;
+
   // auto start = std::chrono::steady_clock::now();
   update_locked = true;
 
@@ -792,18 +812,7 @@ ConnectedComponents MCSketchAlg::connected_components() {
   return cc;
 }
 
-SpanningForest MCSketchAlg::calc_spanning_forest() {
-  // TODO: Could probably optimize this a bit by writing new code
-  connected_components();
-
-  SpanningForest ret(num_vertices, spanning_forest);
-#ifdef VERIFY_SAMPLES_F
-  verifier->verify_spanning_forests(std::vector<SpanningForest>{ret});
-#endif
-  return ret;
-}
-
-SpanningForest MCSketchAlg::get_k_spanning_forest(int graph_id) {
+SpanningForest MCSketchAlg::calc_spanning_forest(size_t graph_id) {
   bool except = false;
   std::exception_ptr err;
   try {
@@ -813,20 +822,47 @@ SpanningForest MCSketchAlg::get_k_spanning_forest(int graph_id) {
     err = std::current_exception();
   }
 
-  ConnectedComponents cc(num_vertices, dsu);
+  SpanningForest ret(num_vertices, spanning_forest);
+#ifdef VERIFY_SAMPLES_F
+  verifier->verify_spanning_forests(std::vector<SpanningForest>{ret});
+#endif
+  return ret;
+}
 
-  // Note: Get num_cc for spanning forest
-  std::cout << "    round = " << last_query_rounds << " cc size = " << cc.size() << "\n";
+std::vector<SpanningForest> MCSketchAlg::calc_disjoint_spanning_forests(size_t graph_id, size_t k) {
+  std::vector<SpanningForest> SFs;
+  size_t max_rounds = 0;
 
-  // Note: Turning these off for now for performance, but turn it back on if run into OutOfSamplesException 
-  // get ready for ingesting more from the stream by resetting the sketches sample state
-  for (node_id_t i = 0; i < num_vertices * max_sketch_graphs; i++) {
-    sketches[i]->reset_sample_state();
+  for (size_t i = 0; i < k; i++) {
+    SpanningForest sf = calc_spanning_forest(graph_id);
+
+    max_rounds = std::max(last_query_rounds, max_rounds);
+
+    SFs.push_back(sf);
+
+    if (i + 1 < k) {
+      for (auto edge : sf.get_edges()) {
+        update_subgraph(graph_id, {edge, DELETE}); // deletes the found edge
+      }
+    }
   }
 
-  if (except) std::rethrow_exception(err);
+  // revert the state of the sketches to remove all deletions
+  for (size_t i = 0; i < k - 1; i++) {
+    const auto &sf = SFs[i];
+    for (auto edge : sf.get_edges()) {
+      update_subgraph(graph_id, {edge, INSERT}); // reinserts the deleted edge
+    }
+  }
+#ifdef VERIFY_SAMPLES_F
+  verifier->verify_spanning_forests(SFs);
+#endif
 
-  return SpanningForest(num_vertices, spanning_forest);
+  // number of rounds per SF may be non-monotonic, so we track the maximum number of rounds
+  // among all of the spanning forest queries.
+  last_query_rounds = max_rounds;
+
+  return SFs;
 }
 
 bool MCSketchAlg::point_query(node_id_t a, node_id_t b) {
@@ -907,6 +943,7 @@ MinCut MCSketchAlg::calc_minimum_cut(const std::vector<Edge> &edges) {
       right.insert(i);
   }
 
+  delete mc;
   return {left, right, cut};
 }
 

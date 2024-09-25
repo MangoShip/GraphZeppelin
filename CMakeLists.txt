@@ -125,6 +125,7 @@ target_compile_options(CUDALibrary PUBLIC -lineinfo) # -lineinfo: For profiling
 add_library(GraphZeppelin
   src/cc_sketch_alg.cpp
   src/mc_sketch_alg.cpp
+  src/edge_store.cpp
   src/return_types.cpp
   src/driver_configuration.cpp
   src/cc_alg_configuration.cpp
@@ -139,6 +140,7 @@ target_compile_definitions(GraphZeppelin PUBLIC XXH_INLINE_ALL)
 
 add_library(GraphZeppelinVerifyCC
   src/cc_sketch_alg.cpp
+  src/edge_store.cpp
   src/return_types.cpp
   src/driver_configuration.cpp
   src/cc_alg_configuration.cpp
@@ -157,6 +159,7 @@ if (BUILD_EXE)
     test/test_runner.cpp
     test/cc_alg_test.cpp
     test/sketch_test.cpp
+    test/edge_store_test.cpp
     test/dsu_test.cpp
     test/util_test.cpp
     test/util/graph_verifier_test.cpp)

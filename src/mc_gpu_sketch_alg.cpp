@@ -4,216 +4,125 @@
 #include <thread>
 #include <vector>
 
+// call this function after we have found the depth of each update
+void MCGPUSketchAlg::complete_update_batch(int thr_id, const TaggedUpdateBatch &updates) {
+  node_id_t min_subgraph = updates.min_subgraph;
+  node_id_t first_es_subgraph = updates.first_es_subgraph;
+
+  if (first_es_subgraph == 0) {
+    std::cerr << "Why are we here??" << std::endl;
+    throw std::runtime_error("gross");
+  }
+
+  // do we need to allocate more sketches due to edge_store contraction
+  if (first_es_subgraph > cur_subgraphs) {
+    sketch_creation_lock.lock();
+
+    // double check to ensure no one else performed the allocation 
+    if (first_es_subgraph > cur_subgraphs) {
+      create_sketch_graph(cur_subgraphs, sketchParams);
+      subgraphs[cur_subgraphs].initialize(this, cur_subgraphs, num_nodes, num_host_threads, num_device_threads, num_batch_per_buffer,
+             sketchParams);
+      cur_subgraphs++; // do this last so that threads only touch params/sketches when initialized
+    }
+
+    sketch_creation_lock.unlock();
+  }
+
+  node_id_t src_vertex = updates.src;
+  auto &dsts_data = updates.dsts_data;
+
+  size_t cur_pos = 0;
+
+  while (cur_pos < dsts_data.size()) {
+    int stream_id = get_and_apply_finished_stream(thr_id);
+    int start_index = stream_id * batch_size;
+
+    // TODO: Make this memory allocation less sad
+    // TODO: More accurately, probably want to use StandAloneGutters for each subgraph
+    //       and directly insert to that instead of any buffering here. But I'm lazy.
+    std::vector<std::vector<node_id_t>> update_buffers(max_sketch_graphs);
+    node_id_t max_subgraph = 0;
+
+    // limit amount we process here to a single batch
+    size_t num_to_process = std::min(size_t(batch_size), dsts_data.size() - cur_pos);
+    for (size_t i = cur_pos; i < cur_pos + num_to_process; i++) {
+      auto &dst_data = dsts_data[i];
+      node_id_t update_subgraphs = std::min(dst_data.subgraph, first_es_subgraph - 1);
+      max_subgraph = std::max(update_subgraphs, max_subgraph);
+
+      for (size_t graph_id = min_subgraph; graph_id <= update_subgraphs; graph_id++) {
+        update_buffers[graph_id].push_back(dst_data.dst);
+      }
+    }
+    cur_pos += num_to_process;
+
+    for (size_t graph_id = 0; graph_id <= max_subgraph; graph_id++) {
+      subgraphs[graph_id].apply_update_batch(thr_id, src_vertex, update_buffers[graph_id]);
+    }
+  }
+}
+
 void MCGPUSketchAlg::apply_update_batch(int thr_id, node_id_t src_vertex,
                                      const std::vector<node_id_t> &dst_vertices) {
   if (MCSketchAlg::get_update_locked()) throw UpdateLockedException();
 
-  // If trim enabled, perform sketch updates in CPU
-  if (trim_enabled) {
-    if (trim_graph_id < 0 || trim_graph_id >= num_graphs) {
-      std::cout << "INVALID trim_graph_id: " << trim_graph_id << "\n";
-    }
-    
-    if (subgraphs[trim_graph_id]->get_type() != SKETCH) {
-      std::cout << "Current trim_graph_id isn't SKETCH data structure: " << trim_graph_id << "\n";
-    }
+  node_id_t first_es_subgraph = edge_store.get_first_store_subgraph();
 
-    batch_sizes += dst_vertices.size();
-    apply_update_batch_single_graph(thr_id, trim_graph_id, src_vertex, dst_vertices);
-  }
-
-  else {
-
-    std::vector<std::vector<node_id_t>> local_buffer;
-    local_buffer.assign(num_graphs, std::vector<node_id_t>());
-    int max_depth = 0;
-
-    for (vec_t i = 0; i < dst_vertices.size(); i++) {
-      // Determine the depth of current edge
-      vec_t edge_id = static_cast<vec_t>(concat_pairing_fn(src_vertex, dst_vertices[i]));
-      int depth = Bucket_Boruvka::get_index_depth(edge_id, 0, num_graphs-1);
-      max_depth = std::max(depth, max_depth);
-
-      for (int graph_id = 0; graph_id <= depth; graph_id++) {
-        local_buffer[graph_id].push_back(dst_vertices[i]);
-      }
-    } 
-    
-    // Go every subgraph and apply updates
-    for (int graph_id = 0; graph_id <= max_depth; graph_id++) {
-      if (graph_id >= max_sketch_graphs) { // Fixed Adj. list
-        subgraphs[graph_id]->insert_adj_edge(src_vertex, local_buffer[graph_id]);
-      }
-      else {
-        if (subgraphs[graph_id]->get_type() == SKETCH) { // Perform Sketch updates
-          subgraphs[graph_id]->insert_sketch_buffer(thr_id, src_vertex, local_buffer[graph_id]);
-        }
-        else { // Perform Adj. list updates
-          subgraphs[graph_id]->insert_adj_edge(src_vertex, local_buffer[graph_id]);
-
-          // Check the size of adj. list after insertion
-          double adjlist_bytes = subgraphs[graph_id]->get_num_updates() * adjlist_edge_bytes;
-
-          if (adjlist_bytes > sketch_bytes) { // With size of current adj. list, it is more space-efficient to convert into sketch graph
-
-            if(subgraphs[graph_id]->try_acq_conversion()) {
-              // Init sketches 
-              std::cout << "Graph #" << graph_id << " is now sketch graph\n";
-
-              //convert_sketch = graph_id;
-              num_adj_graphs--;
-              num_sketch_graphs++;
-
-              subgraphs[graph_id]->set_type(SKETCH);
-            }
-          }
-        }
-      }
-    }    
-  }
-}
-
-void MCGPUSketchAlg::flush_buffers() {
-  if (num_sketch_graphs == 0) {
+  // We only have an adjacency list so just directly insert
+  if (first_es_subgraph == 0) {
+    TaggedUpdateBatch more_upds = edge_store.insert_adj_edges(src_vertex, dst_vertices);
+    if (more_upds.dsts_data.size() > 0) complete_update_batch(thr_id, more_upds);
     return;
   }
 
-  std::cout << "Flushing buffers for (" << num_sketch_graphs << ") sketch graphs\n";
-  std::vector<std::chrono::duration<double>> indiv_flush_time;
-  auto flush_start = std::chrono::steady_clock::now();
+  // TODO: This memory allocation is sad
+  std::vector<SubgraphTaggedUpdate> &store_edges = store_buffers[thr_id];
+  std::vector<SubgraphTaggedUpdate> &sketch_edges = sketch_buffers[thr_id];
 
-  for (int graph_id = 0; graph_id < num_sketch_graphs; graph_id++) {
-    auto indiv_flush_start = std::chrono::steady_clock::now();
-    subgraphs[graph_id]->flush_sketch_buffers();
-    cudaDeviceSynchronize();
-    indiv_flush_time.push_back(std::chrono::steady_clock::now() - indiv_flush_start);
+  for (vec_t i = 0; i < dst_vertices.size(); i++) {
+    // Determine the depth of current edge
+    vec_t edge_id = static_cast<vec_t>(concat_pairing_fn(src_vertex, dst_vertices[i]));
+    size_t subgraph = Bucket_Boruvka::get_index_depth(edge_id, 0, num_subgraphs-1);
+
+    if (subgraph >= first_es_subgraph) {
+      // Adj. list
+      store_edges.push_back({subgraph, dst_vertices[i]});
+    }
+    sketch_edges.push_back({subgraph, dst_vertices[i]});
   }
 
-  std::chrono::duration<double> flush_time = std::chrono::steady_clock::now() - flush_start;
-  std::cout << "Finished flushing buffers for (" << num_sketch_graphs << ") sketch graphs. Total Elpased time: " << flush_time.count() << "\n";
-  for (int graph_id = 0; graph_id < num_sketch_graphs; graph_id++) {
-    std::cout << "  S" << graph_id << ": " << indiv_flush_time[graph_id].count() << "\n";
-  }
+  // Perform adjacency list updates
+  TaggedUpdateBatch more_upds =
+      edge_store.insert_adj_edges(src_vertex, first_es_subgraph, store_edges);
+  if (sketch_edges.size() > 0)
+    complete_update_batch(thr_id, {src_vertex, 0, first_es_subgraph, sketch_edges});
+  if (more_upds.dsts_data.size() > 0)
+    complete_update_batch(thr_id, more_upds);
 
+  store_edges.clear();
+  sketch_edges.clear();
 }
 
-void MCGPUSketchAlg::convert_adj_to_sketch() {
-  if (num_sketch_graphs == 0) {
-    return;
+void MCGPUSketchAlg::apply_flush_updates() {
+
+  // first ensure that all pending contractions are moved out of the edge store.
+  while (edge_store.contract_in_progress()) {
+    TaggedUpdateBatch more_upds =
+        edge_store.vertex_advance_subgraph(edge_store.get_first_store_subgraph());
+
+    if (more_upds.dsts_data.size() > 0) complete_update_batch(0, more_upds);
   }
 
-  std::cout << "Converting adj.list graphs (" << num_sketch_graphs << ") into sketch graphs\n";
-  std::vector<std::chrono::duration<double>> indiv_conversion_time;
-  auto conversion_start = std::chrono::steady_clock::now();
-
-  // Rewrite GPU Kernel Shared Memory's size
-  size_t maxBytes = sketchParams.num_buckets * sizeof(vec_t) + sketchParams.num_buckets * sizeof(vec_hash_t);
-  cudaKernel.updateSharedMemory(maxBytes);
-
-  for (int graph_id = 0; graph_id < num_sketch_graphs; graph_id++) {
-    std::cout << "Graph #" << graph_id << "...";
-    auto indiv_conversion_start = std::chrono::steady_clock::now();
-
-    int current_index = 0;
-    int batch_count = 0;
-
-    node_id_t *h_edgeUpdates, *d_edgeUpdates;
-    gpuErrchk(cudaMallocHost(&h_edgeUpdates, subgraphs[graph_id]->get_num_adj_edges() * sizeof(node_id_t)));
-    gpuErrchk(cudaMalloc(&d_edgeUpdates, subgraphs[graph_id]->get_num_adj_edges() * sizeof(node_id_t)));
-
-    std::vector<node_id_t> h_update_src;
-    std::vector<vec_t> h_update_sizes, h_update_start_index;
-
-    for (node_id_t src = 0; src < num_nodes; src++) {
-      std::set<node_id_t> dst_vertices = subgraphs[graph_id]->get_neighbor_nodes(src);
-            
-      if (dst_vertices.size() == 0) { // No neighbor nodes for this src vertex
-        continue;
-      }
-
-      h_update_start_index.push_back(current_index);
-
-      // Go through all neighbor nodes and fill in buffer
-      for (auto dst : dst_vertices) {
-        h_edgeUpdates[current_index] = dst;
-        current_index++;
-      }
-
-      // Update num_sketch_updates
-      subgraphs[graph_id]->increment_num_sketch_updates(dst_vertices.size());
-      h_update_sizes.push_back(dst_vertices.size());
-      h_update_src.push_back(src);
-      batch_count++;
-    } 
-
-    Bucket *h_buckets;
-    if (!sketchParams.cudaUVM_enabled) {
-      gpuErrchk(cudaFree(subgraphs[graph_id]->get_sketchParams().d_buckets));
-
-      gpuErrchk(cudaMallocHost(&h_buckets, sketchParams.num_buckets * batch_count * sizeof(Bucket)));
-      gpuErrchk(cudaMalloc(&subgraphs[graph_id]->get_sketchParams().d_buckets, sketchParams.num_buckets * batch_count * sizeof(Bucket)));
-    }
-
-
-    node_id_t *d_update_src;
-    vec_t *d_update_sizes, *d_update_start_index;
-    gpuErrchk(cudaMalloc(&d_update_src, batch_count * sizeof(node_id_t)));
-    gpuErrchk(cudaMalloc(&d_update_sizes, batch_count * sizeof(vec_t)));
-    gpuErrchk(cudaMalloc(&d_update_start_index, batch_count * sizeof(vec_t)));
-
-    gpuErrchk(cudaMemcpy(d_update_src, h_update_src.data(), batch_count * sizeof(node_id_t), cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(d_update_sizes, h_update_sizes.data(), batch_count * sizeof(vec_t), cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(d_update_start_index, h_update_start_index.data(), batch_count * sizeof(vec_t), cudaMemcpyHostToDevice));
-
-    gpuErrchk(cudaMemcpy(d_edgeUpdates, h_edgeUpdates, subgraphs[graph_id]->get_num_adj_edges() * sizeof(node_id_t), cudaMemcpyHostToDevice));
-    cudaKernel.single_sketchUpdate(num_device_threads, batch_count, batch_count, d_edgeUpdates, d_update_src, d_update_sizes, d_update_start_index, subgraphs[graph_id]->get_sketchParams());
-    cudaDeviceSynchronize();
-
-    if (!sketchParams.cudaUVM_enabled) {
-      // Transfer back delta sketch
-      gpuErrchk(cudaMemcpy(h_buckets, subgraphs[graph_id]->get_sketchParams().d_buckets, sketchParams.num_buckets * batch_count * sizeof(Bucket), cudaMemcpyDeviceToHost));
-
-      // Apply delta sketch
-      for (int batch_id = 0; batch_id < batch_count; batch_id++) {
-        node_id_t src = h_update_src[batch_id];
-        src = (graph_id * num_nodes) + src;
-        apply_raw_buckets_update(src, &h_buckets[batch_id * sketchParams.num_buckets]);
-      }
-
-      // Free memory
-      gpuErrchk(cudaFree(subgraphs[graph_id]->get_sketchParams().d_buckets));
-    }
-
-    gpuErrchk(cudaFree(d_edgeUpdates));
-    gpuErrchk(cudaFree(d_update_src));
-    gpuErrchk(cudaFree(d_update_sizes));
-    gpuErrchk(cudaFree(d_update_start_index));
-
-    indiv_conversion_time.push_back(std::chrono::steady_clock::now() - indiv_conversion_start);
-    std::cout << "Finished.\n";
-  }
-
-  std::chrono::duration<double> conversion_time = std::chrono::steady_clock::now() - conversion_start;
-  std::cout << "Finished converting adj.list graphs (" << num_sketch_graphs << ") into sketch graphs. Total Elpased time: " << conversion_time.count() << "\n";
-  for (int graph_id = 0; graph_id < num_sketch_graphs; graph_id++) {
-    std::cout << "  S" << graph_id << ": " << indiv_conversion_time[graph_id].count() << "\n";
-  }
-}
-
-std::vector<Edge> MCGPUSketchAlg::get_adjlist_spanning_forests(int graph_id, int k) {
-  if (subgraphs[graph_id]->get_type() == SKETCH) {
-    std::cout << "Subgraph with graph_id: " << graph_id << " is Sketch graph!\n";
+  for (size_t graph_id = 0; graph_id < cur_subgraphs; graph_id++) {
+    subgraphs[graph_id].flush();
   }
   
-  std::vector<Edge> edges;
-  for (node_id_t src = 0; src < num_nodes; src++) {
-    for (auto dst : subgraphs[graph_id]->get_neighbor_nodes(src)) {
-      edges.push_back({src, dst});
-    }
 
-    // Delete sampled edge from adj. list
-    //std::cout << "    Trimming spanning forest " << k_id << "\n";
-    //subgraphs[graph_id]->adjlist_trim_forest(forest);
-  }
-  return edges;
+  // ensure streams have finished applying updates
+  cudaDeviceSynchronize();
+}
+
+std::vector<Edge> MCGPUSketchAlg::get_adjlist_spanning_forests() {
+  return edge_store.get_edges();
 }

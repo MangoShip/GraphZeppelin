@@ -594,6 +594,39 @@ SpanningForest CCSketchAlg::calc_spanning_forest() {
   return ret;
 }
 
+std::vector<SpanningForest> CCSketchAlg::calc_disjoint_spanning_forests(size_t k) {
+  std::vector<SpanningForest> SFs;
+  size_t max_rounds = 0;
+
+  for (size_t i = 0; i < k; i++) {
+    SpanningForest sf = calc_spanning_forest();
+
+    max_rounds = std::max(last_query_rounds, max_rounds);
+
+    SFs.push_back(sf);
+
+    for (auto edge : sf.get_edges()) {
+      update({edge, DELETE}); // deletes the found edge
+    }
+  }
+
+  // revert the state of the sketches to remove all deletions
+  for (auto &sf : SFs) {
+    for (auto edge : sf.get_edges()) {
+      update({edge, INSERT}); // reinserts the deleted edge
+    }
+  }
+#ifdef VERIFY_SAMPLES_F
+  verifier->verify_spanning_forests(SFs);
+#endif
+
+  // number of rounds per SF may be non-monotonic, so we track the maximum number of rounds
+  // among all of the spanning forest queries.
+  last_query_rounds = max_rounds;
+
+  return SFs;
+}
+
 bool CCSketchAlg::point_query(node_id_t a, node_id_t b) {
   cc_alg_start = std::chrono::steady_clock::now();
 

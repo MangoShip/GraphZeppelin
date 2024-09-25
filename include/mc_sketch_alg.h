@@ -12,6 +12,7 @@
 #include <memory>
 #include <cassert>
 
+#include "cuda_kernel.cuh"
 #include "cc_alg_configuration.h"
 #include "return_types.h"
 #include "sketch.h"
@@ -153,8 +154,10 @@ class MCSketchAlg {
               CCAlgConfiguration config);
 
  public:
-  MCSketchAlg(node_id_t num_vertices, bool cuda_uvm, size_t seed, Bucket* first_graph_buckets, int _max_sketch_graphs, CCAlgConfiguration config = CCAlgConfiguration());
+  MCSketchAlg(node_id_t num_vertices, size_t seed, int _max_sketch_graphs, CCAlgConfiguration config = CCAlgConfiguration());
   ~MCSketchAlg();
+
+  void create_sketch_graph(int graph_id, SketchParams sketchParams);
 
   // construct a MC algorithm from a serialized file
   static MCSketchAlg * construct_from_serialized_data(
@@ -240,7 +243,7 @@ class MCSketchAlg {
    * 
    * This function is not thread-safe
    */
-  void update(GraphUpdate upd);
+  void update_subgraph(int graph_id, GraphUpdate upd);
 
   /**
    * Main parallel query algorithm utilizing Boruvka and L_0 sampling.
@@ -262,9 +265,9 @@ class MCSketchAlg {
    * that is, unless you really know what you're doing.
    * @return  the spanning forest of the graph
    */
-  SpanningForest calc_spanning_forest();
+  SpanningForest calc_spanning_forest(size_t graph_id = 0);
 
-  SpanningForest get_k_spanning_forest(int graph_id);
+  std::vector<SpanningForest> calc_disjoint_spanning_forests(size_t graph_id, size_t k);
 
   // compute the minimum cut of the graph defined by the input stream
   MinCut calc_minimum_cut(const std::vector<Edge> &edges);
