@@ -40,6 +40,12 @@ private:
   int num_device_threads;
   bool first_buffer = true;
 
+  // min and max subgraph form a half open range
+  // These are the subgraphs that are affected by these updates
+  // Only relevant for min-cut
+  int min_subgraph;
+  int max_subgraph;
+
 public:
   // Constructor
   CudaStream(Alg *sketching_alg, int graph_id, node_id_t num_nodes, int num_device_threads, int num_batch_per_buffer, SketchParams _sketchParams)
@@ -267,6 +273,14 @@ public:
     else {
       flush_buffers_default();
     }
+  }
+
+  // min and max subgraph form a half open range
+  // These are the subgraphs that are affected by these updates
+  // Only relevant for min-cut
+  void set_range(size_t _min_subgraph, size_t _max_subgraph) {
+    min_subgraph = _min_subgraph;
+    max_subgraph = _max_subgraph;
   }
 
   std::chrono::duration<double> wait_time = std::chrono::nanoseconds::zero(); // Cumulative wait time for prev buffer to finish

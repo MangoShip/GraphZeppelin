@@ -234,6 +234,7 @@ class CCSketchAlg {
    * @return  the spanning forest of the graph
    */
   SpanningForest calc_spanning_forest();
+  std::vector<SpanningForest> calc_disjoint_spanning_forests(size_t k);
 
 #ifdef VERIFY_SAMPLES_F
   void set_verifier(std::unique_ptr<GraphVerifier> verifier) {
