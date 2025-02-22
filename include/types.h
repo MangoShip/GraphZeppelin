@@ -24,6 +24,13 @@ struct SubgraphTaggedUpdate {
 
     return subgraph < oth.subgraph;
   }
+
+  bool operator>(const SubgraphTaggedUpdate& oth) const {
+    if (subgraph == oth.subgraph)
+      return dst > oth.dst;
+
+    return subgraph > oth.subgraph;
+  }
 };
 
 struct TaggedUpdateBatch {

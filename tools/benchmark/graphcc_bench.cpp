@@ -14,6 +14,7 @@
 #include "bucket.h"
 #include "dsu.h"
 #include "sketch.h"
+#include "edge_store.h"
 
 constexpr uint64_t KB = 1024;
 constexpr uint64_t MB = KB * KB;
@@ -533,5 +534,37 @@ static void BM_Parallel_DSU_Root(benchmark::State& state) {
                          benchmark::Counter::kIsRate | benchmark::Counter::kInvert);
 }
 BENCHMARK(BM_Parallel_DSU_Root)->RangeMultiplier(2)->Range(1, 8)->UseRealTime();
+
+
+static void BM_EdgeStore(benchmark::State& state) {
+  node_id_t num_vertices = 1 << 13;
+  node_id_t sketch_size = 1 << 20; // artificially large so we don't have to worry abt contractions
+
+  EdgeStore edge_store(seed, num_vertices, sketch_size, 20);
+
+  std::vector<node_id_t> dst_vertices;
+  for (node_id_t i = 0; i < 182; i++) { // 182 is roughly half of a sketch size on 2^13 vertices
+    dst_vertices.push_back(i);
+    dst_vertices.push_back(i);
+  }
+
+  std::vector<node_id_t> initial_contents;
+  for (node_id_t i = 0; i < 364; i++) {
+    initial_contents.push_back(i + 182);
+  }
+  for (node_id_t i = 0; i < num_vertices; i++) {
+    edge_store.insert_adj_edges(i, initial_contents);
+  }
+
+  std::shuffle(dst_vertices.begin(), dst_vertices.end(), std::default_random_engine{});
+
+  for (auto _ : state) {
+    node_id_t src = rand() % num_vertices;
+    edge_store.insert_adj_edges(src, dst_vertices);
+  }
+  state.counters["Throughput"] =
+      benchmark::Counter(state.iterations() * dst_vertices.size(), benchmark::Counter::kIsRate);
+}
+BENCHMARK(BM_EdgeStore);
 
 BENCHMARK_MAIN();
