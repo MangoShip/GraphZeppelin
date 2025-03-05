@@ -7,6 +7,7 @@
 #include <random>
 #include <omp.h>
 #include <unordered_map>
+#include <thread>
 
 #include <algorithms/global_mincut/algorithms.h>
 #include <algorithms/global_mincut/minimum_cut.h>
@@ -93,7 +94,7 @@ MCSketchAlg::~MCSketchAlg() {
 void MCSketchAlg::create_sketch_graph(int graph_id, const SketchParams sketchParams) {
   // Validate graph_id
   if (graph_id >= max_sketch_graphs || graph_id != num_sketch_graphs) {
-    std::cout << "Invalid graph_id in create_sketch_graph()! " << graph_id << "\n";
+    std::cerr << "ERROR: Invalid graph_id in create_sketch_graph()! " << graph_id << "\n";
     return;
   }
 
@@ -102,15 +103,33 @@ void MCSketchAlg::create_sketch_graph(int graph_id, const SketchParams sketchPar
   vec_t sketch_vec_len = Sketch::calc_vector_length(num_vertices);
   size_t sketch_num_samples = Sketch::calc_cc_samples(num_vertices, config.get_sketches_factor());
 
-  if (sketchParams.cudaUVM_enabled) {
-    for (node_id_t i = 0; i < num_vertices; ++i) {
-      sketches[(graph_id * num_vertices) + i] = new Sketch(sketch_vec_len, seed, i, sketchParams.cudaUVM_buckets, sketch_num_samples);
+  auto sketch_create_task = [&](size_t beg, size_t end) {
+    if (sketchParams.cudaUVM_enabled) {
+      for (node_id_t i = beg; i < end; ++i) {
+        sketches[(graph_id * num_vertices) + i] =
+            new Sketch(sketch_vec_len, seed, i, sketchParams.cudaUVM_buckets, sketch_num_samples);
+      }
     }
+    else {
+      for (node_id_t i = beg; i < end; ++i) {
+        sketches[(graph_id * num_vertices) + i] =
+            new Sketch(sketch_vec_len, seed, sketch_num_samples);
+      }
+    }
+  };
+
+  size_t num_threads = std::max(int(std::thread::hardware_concurrency()) / 2, 1);
+  std::vector<std::thread> threads(num_threads);
+  node_id_t cur = 0;
+  node_id_t amt = num_vertices / num_threads;
+  for (size_t i = 0; i < num_threads - 1; i++) {
+    threads[i] = std::thread(sketch_create_task, cur, cur + amt);
+    cur += amt;
   }
-  else {
-    for (node_id_t i = 0; i < num_vertices; ++i) {
-      sketches[(graph_id * num_vertices) + i] = new Sketch(sketch_vec_len, seed, sketch_num_samples);
-    }
+  threads[num_threads - 1] = std::thread(sketch_create_task, cur, num_vertices);
+
+  for (auto& thr : threads) {
+    thr.join();
   }
 
   num_sketch_graphs++;
