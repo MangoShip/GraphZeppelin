@@ -53,7 +53,7 @@ class SketchSubgraph {
                   size_t _batch_size, SketchParams _sketchParams);
 
   // Insert an edge to the subgraph
-  void batch_insert(int thr_id, const node_id_t src, const std::array<node_id_t, 16> dsts,
+  void batch_insert(int thr_id, const node_id_t src, const std::array<node_id_t, 32> dsts,
                     const size_t num_elms);
 
   void flush() {
@@ -152,6 +152,7 @@ private:
 
   // lossless edge storage
   EdgeStore edge_store;
+  static constexpr size_t initial_sketch_graphs = 1;
 
   // Number of edge updates in single batch
   size_t batch_size;
@@ -167,10 +168,11 @@ private:
 public:
   MCGPUSketchAlg(node_id_t num_vertices, int num_threads, int _num_reader_threads,
                 SketchParams _sketchParams, int _num_subgraphs,
-                int _max_sketch_graphs, int _k, size_t _sketch_bytes, int _initial_sketch_graphs,
+                int _max_sketch_graphs, int _k, size_t _sketch_bytes, bool use_edge_store,
                 CCAlgConfiguration config)
      : MCSketchAlg(num_vertices, _sketchParams.seed, _max_sketch_graphs, config),
-       edge_store(_sketchParams.seed, num_vertices, _sketch_bytes, _num_subgraphs, _initial_sketch_graphs) {
+       edge_store(_sketchParams.seed, num_vertices, _sketch_bytes, _num_subgraphs,
+                  (use_edge_store ? initial_sketch_graphs : _max_sketch_graphs)) {
     // Start timer for initializing
     auto init_start = std::chrono::steady_clock::now();
 
@@ -181,14 +183,14 @@ public:
     num_host_threads = num_threads;
     num_reader_threads = _num_reader_threads;
 
-    if (_max_sketch_graphs < _initial_sketch_graphs) {
-      std::cerr << "ERROR: Cannot have initial sketch graphs > max sketch graphs" << std::endl;
-      exit(EXIT_FAILURE);
-    }
     num_subgraphs = _num_subgraphs;
-    cur_subgraphs = _initial_sketch_graphs;
     max_sketch_graphs = _max_sketch_graphs;
     subgraphs = new SketchSubgraph[max_sketch_graphs];
+    if (use_edge_store) {
+      cur_subgraphs = initial_sketch_graphs;
+    } else {
+      cur_subgraphs = max_sketch_graphs;
+    }
 
     // Create a bigger batch size to apply edge updates when subgraph is turning into sketch
     // representation
