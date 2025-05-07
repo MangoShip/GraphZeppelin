@@ -1,3 +1,5 @@
+#include <fstream>
+#include <iomanip>
 #include <vector>
 #include <graph_sketch_driver.h>
 #include <cc_gpu_sketch_alg.h>
@@ -166,6 +168,8 @@ int main(int argc, char **argv) {
   shutdown = true;
   querier.join();
 
+  double memory = get_max_mem_used();
+
   double num_seconds = insert_time.count();
   std::cout << "Total insertion time(sec):    " << num_seconds << std::endl;
   std::cout << "Updates per second:           " << stream.edges() / num_seconds << std::endl;
@@ -176,5 +180,11 @@ int main(int argc, char **argv) {
   std::cout << "  UVM - Prefetch (sec):       " << pref_time.count() << std::endl;     
   std::cout << "  Boruvka's Algorithm(sec):   " << cc_alg_time.count() << std::endl;
   std::cout << "Connected Components:         " << CC_num << std::endl;
-  std::cout << "Maximum Memory Usage(MiB):    " << get_max_mem_used() << std::endl;
+  std::cout << "Maximum Memory Usage(MiB):    " << memory << std::endl;
+
+  std::ofstream out("runtime_results.csv", std::ios_base::out | std::ios_base::app);
+  out << std::fixed;
+  out << std::setprecision(3);
+  out << stream.edges() / num_seconds / 1e6 << ", " << memory << ", " << cc_time.count() 
+      << std::endl;
 }
