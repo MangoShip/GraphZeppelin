@@ -23,7 +23,9 @@ constexpr uint64_t seed = 374639;
 // If this flag is uncommented then run the FileIngestion benchmarks
 // #define FILE_INGEST_F
 
+
 #ifdef FILE_INGEST_F
+const std::string stream_file_path = "<path/to/stream>";
 // Linux-only, flush the filesystem cache
 // requires sudo privileges :(
 static void flush_filesystem_cache() {
@@ -42,7 +44,7 @@ static void BM_FileIngest(benchmark::State& state) {
   // determine the number of edges in the graph
   uint64_t num_edges;
   {
-    BinaryFileStream stream("/mnt/ssd2/binary_streams/kron_15_stream_binary");
+    BinaryFileStream stream(stream_file_path);
     num_edges = stream.edges();
   }
 
@@ -51,12 +53,12 @@ static void BM_FileIngest(benchmark::State& state) {
 
   // perform benchmark
   for (auto _ : state) {
-    BinaryFileStream stream("/mnt/ssd2/binary_streams/kron_15_stream_binary");
+    BinaryFileStream stream(stream_file_path);
 
     bool reading = true;
     while (reading) {
       GraphStreamUpdate upds[state.range(0)];
-      size_t num_updates = stream->get_update_buffer(upds, state.range(0));
+      size_t num_updates = stream.get_update_buffer(upds, state.range(0));
       for (size_t i = 0; i < num_updates; i++) {
         GraphStreamUpdate &upd = upds[i];
         if (upd.type == BREAKPOINT) {
@@ -76,7 +78,7 @@ static void BM_MTFileIngest(benchmark::State& state) {
   // determine the number of edges in the graph
   uint64_t num_edges;
   {
-    BinaryFileStream stream("/mnt/ssd2/binary_streams/kron_15_stream_binary");
+    BinaryFileStream stream(stream_file_path);
     num_edges = stream.edges();
   }
 
@@ -88,13 +90,13 @@ static void BM_MTFileIngest(benchmark::State& state) {
     std::vector<std::thread> threads;
     threads.reserve(state.range(0));
 
-    BinaryFileStream stream("/mnt/ssd2/binary_streams/kron_15_stream_binary");
+    BinaryFileStream stream(stream_file_path);
 
     auto task = [&]() {
       bool reading = true;
       while (reading) {
-        GraphStreamUpdate upds[1024];
-        size_t num_updates = stream->get_update_buffer(upds, 1024);
+        GraphStreamUpdate upds[8 * KB];
+        size_t num_updates = stream.get_update_buffer(upds, 8 * KB);
         for (size_t i = 0; i < num_updates; i++) {
           GraphStreamUpdate &upd = upds[i];
           if (upd.type == BREAKPOINT) {
@@ -111,7 +113,7 @@ static void BM_MTFileIngest(benchmark::State& state) {
   state.counters["Ingestion_Rate"] =
       benchmark::Counter(state.iterations() * num_edges, benchmark::Counter::kIsRate);
 }
-BENCHMARK(BM_MTFileIngest)->RangeMultiplier(4)->Range(1, 20)->UseRealTime();
+BENCHMARK(BM_MTFileIngest)->RangeMultiplier(4)->Range(1, std::thread::hardware_concurrency())->UseRealTime();
 #endif  // FILE_INGEST_F
 
 static void BM_builtin_ffsll(benchmark::State& state) {

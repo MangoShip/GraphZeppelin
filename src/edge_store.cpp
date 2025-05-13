@@ -72,6 +72,26 @@ TaggedUpdateBatch EdgeStore::insert_adj_edges(node_id_t src, node_id_t caller_fi
   // Sort the input data
   std::sort(dst_data, dst_data + dst_data_size);
 
+  // remove pairs of duplicate updates if there are any
+  size_t ptr = 0;
+  size_t dst_ptr = 0;
+  while (ptr < dst_data_size - 1) {
+    if (dst_data[ptr] < dst_data[ptr+1]) {
+      // not a pair, write to output
+      dst_data[dst_ptr] = dst_data[ptr];
+      ++ptr;
+      ++dst_ptr;
+    } else {
+      // found a pair, skip it
+      ptr += 2;
+    }
+  }
+  if (ptr < dst_data_size) {
+    dst_data[dst_ptr] = dst_data[ptr];
+    ++dst_ptr;
+  }
+  dst_data_size = dst_ptr;
+
   // merge the input data into the vertex buffer
   {
     std::lock_guard<std::mutex> lk(adj_mutex[src]);
@@ -83,10 +103,11 @@ TaggedUpdateBatch EdgeStore::insert_adj_edges(node_id_t src, node_id_t caller_fi
 
     auto &data_buffer = adjlist[src];
     size_t orig_size = data_buffer.size();
+    std::vector<SubgraphTaggedUpdate> new_data_buffer(orig_size + dst_data_size);
 
     size_t out_ptr = 0;
-    size_t buffer_ptr = 0;
     size_t update_ptr = 0;
+    size_t buffer_ptr = 0;
 
     // if the caller constructed the update buffer with bad info
     // copy the update buffer into ret
@@ -94,7 +115,7 @@ TaggedUpdateBatch EdgeStore::insert_adj_edges(node_id_t src, node_id_t caller_fi
       ret.insert(ret.end(), dst_data, dst_data + dst_data_size);
     }
 
-    // place any updates that go to a smaller subgraph into ret
+    // skip any updates that go to a smaller subgraph
     while (dst_data[update_ptr].subgraph < cur_first_es_subgraph) {
       ++update_ptr;
     }
@@ -104,20 +125,16 @@ TaggedUpdateBatch EdgeStore::insert_adj_edges(node_id_t src, node_id_t caller_fi
     size_t local_ignored = update_ptr;
 #endif
 
-    // merge new updates in
-    while (buffer_ptr < data_buffer.size()) {
+    // merge new updates in, until one of the arrays runs out
+    while (buffer_ptr < orig_size && update_ptr < dst_data_size) {
       if (data_buffer[buffer_ptr] > dst_data[update_ptr]) {
-        SubgraphTaggedUpdate temp = data_buffer[buffer_ptr];
-        data_buffer[out_ptr] = dst_data[update_ptr];
-        dst_data[update_ptr] = temp;
-        ++buffer_ptr;
-        ++out_ptr;
-      }
-      else if (data_buffer[buffer_ptr] < dst_data[update_ptr]) {
-        data_buffer[out_ptr] = data_buffer[buffer_ptr];
-        ++buffer_ptr;
-        ++out_ptr;
-      } else { // they are equal! Delete them both
+        // place update_ptr data into output
+        new_data_buffer[out_ptr++] = dst_data[update_ptr++];
+      } else if (data_buffer[buffer_ptr] < dst_data[update_ptr]) {
+        // place contents of compare_ptr into out_ptr
+        new_data_buffer[out_ptr++] = data_buffer[buffer_ptr++];
+      } else { 
+        // they are equal! Skip both
         ++buffer_ptr;
         ++update_ptr;
 
@@ -125,22 +142,18 @@ TaggedUpdateBatch EdgeStore::insert_adj_edges(node_id_t src, node_id_t caller_fi
         num_duplicate += 2;
         local_ignored += 2;
 #endif
-
-        // edge case introduced here. update_ptr can exceed bounds of dst_data
-        if (update_ptr >= dst_data_size) break;
       }
     }
 
     // place all remaining updates into the buffer
-    size_t new_size = out_ptr + (dst_data_size - update_ptr) + (orig_size - buffer_ptr);
-    data_buffer.resize(std::max(new_size, orig_size));
-    while (update_ptr < dst_data_size) {
-      data_buffer[out_ptr++] = dst_data[update_ptr++];
-    }
     while (buffer_ptr < orig_size) {
-      data_buffer[out_ptr++] = data_buffer[buffer_ptr++];
+      new_data_buffer[out_ptr++] = data_buffer[buffer_ptr++];
     }
-    data_buffer.resize(new_size);
+    while (update_ptr < dst_data_size) {
+      new_data_buffer[out_ptr++] = dst_data[update_ptr++];
+    }
+    new_data_buffer.resize(out_ptr);
+    std::swap(data_buffer, new_data_buffer);
 
 #ifdef VERIFY_SAMPLES_F
     // verify sorted order
@@ -155,7 +168,7 @@ TaggedUpdateBatch EdgeStore::insert_adj_edges(node_id_t src, node_id_t caller_fi
       }
     }
 
-    if (out_ptr != orig_size + dst_data_size - local_ignored) {
+    if (data_buffer.size() != orig_size + dst_data_size - local_ignored) {
       std::cerr << "ERROR: Number of updates incorrect!" << std::endl;
       std::cerr << "Expected: " << orig_size + dst_data_size - local_ignored << std::endl;
       std::cerr << "Got: " << out_ptr << std::endl;
@@ -167,7 +180,7 @@ TaggedUpdateBatch EdgeStore::insert_adj_edges(node_id_t src, node_id_t caller_fi
     }
 #endif
 
-    num_edges += out_ptr - orig_size;
+    num_edges += data_buffer.size() - orig_size;
   }
 
   if (ret.size() == 0 && true_min_subgraph < cur_first_es_subgraph) {

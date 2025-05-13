@@ -41,6 +41,32 @@ TEST(EdgeStoreTest, no_contract) {
   }
 }
 
+TEST(EdgeStoreTest, test_sort) {
+  size_t nodes = 1024;
+  size_t skt_bytes = 1 << 25;  // artificially large
+  EdgeStore edge_store(get_seed(), nodes, skt_bytes, 20);
+
+  std::set<Edge> edges_added;
+
+  std::vector<node_id_t> dsts1{1,5,5,10,15,15,15,20,25,30,30,30,40,40};
+  std::vector<node_id_t> dsts2{3,15,20,100,101,102,103};
+  std::set<node_id_t> expect{1,3,10,25,30,100,101,102,103};
+
+  edge_store.insert_adj_edges(0, dsts1);
+  edge_store.insert_adj_edges(0, dsts2);
+
+  std::vector<Edge> edges = edge_store.get_edges();
+  ASSERT_EQ(edge_store.get_num_edges(), 9);
+  ASSERT_EQ(edges.size(), 9);
+
+  for (size_t i = 0; i < 9; i++) {
+    node_id_t src = edges[i].src;
+    node_id_t dst = edges[i].dst;
+    ASSERT_EQ(src, 0);
+    ASSERT_NE(expect.find(dst), expect.end());
+  }
+}
+
 TEST(EdgeStoreTest, no_contract_dupl) {
   size_t nodes = 1024;
   size_t skt_bytes = 1 << 30;  // artificially large
